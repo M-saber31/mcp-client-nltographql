@@ -148,7 +148,7 @@ public class McpClient : IDisposable
         return response.GetRawText();
     }
 
-    private int NextId() => ++_requestId;
+    private int NextId() => Interlocked.Increment(ref _requestId);
 
     private async Task<JsonElement> SendRequestAsync(object request)
     {
