@@ -1,0 +1,254 @@
+using System.Text;
+using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.SemanticKernel.Connectors.AzureOpenAI;
+using DotNetEnv;
+using Spectre.Console;
+using Azure.Identity;
+
+#pragma warning disable SKEXP0001, SKEXP0010, SKEXP0020
+
+namespace Samples.Azure.Database.NL2SQL;
+
+public class ChatBot
+{
+    const string VERSION = "2.0";
+    private readonly string azureOpenAIEndpoint;
+    private readonly string azureOpenAIApiKey;
+    private readonly string chatModelDeploymentName;
+    private readonly string mcpServerUrl;
+
+    public ChatBot(string envFile)
+    {
+        Env.Load(envFile);
+        azureOpenAIEndpoint = Env.GetString("OPENAI_URL");
+        azureOpenAIApiKey = Env.GetString("OPENAI_KEY") ?? string.Empty;
+        chatModelDeploymentName = Env.GetString("OPENAI_CHAT_DEPLOYMENT_NAME");
+        mcpServerUrl = Env.GetString("MCP_SERVER_URL");
+    }
+
+    public async Task RunAsync(bool enableDebug = false)
+    {
+        AnsiConsole.Clear();
+        AnsiConsole.Foreground = Color.Green;
+
+        var table = new Table();
+        table.Expand();
+        table.AddColumn(new TableColumn($"[bold]Natural Language GraphQL Chatbot Agent[/] v{VERSION}").Centered());
+        AnsiConsole.Write(table);
+
+        using var mcpClient = new McpClient(mcpServerUrl);
+
+        var openAIPromptExecutionSettings = new AzureOpenAIPromptExecutionSettings()
+        {
+            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto()
+        };
+
+        (var logger, var kernel, var ai, var schemaSummary) = await AnsiConsole.Status().StartAsync("Booting up agents...", async ctx =>
+        {
+            AnsiConsole.WriteLine("Initializing orchestrator agent...");
+            ctx.Spinner(Spinner.Known.Default);
+            ctx.SpinnerStyle(Style.Parse("yellow"));
+
+            AnsiConsole.WriteLine("Initializing kernel...");
+            var credentials = new DefaultAzureCredential();
+            var sc = new ServiceCollection();
+
+            if (string.IsNullOrEmpty(azureOpenAIApiKey))
+            {
+                sc.AddAzureOpenAIChatCompletion(chatModelDeploymentName, azureOpenAIEndpoint, credentials);
+            }
+            else
+            {
+                sc.AddAzureOpenAIChatCompletion(chatModelDeploymentName, azureOpenAIEndpoint, azureOpenAIApiKey);
+            }
+
+            sc.AddKernel();
+            sc.AddLogging(b =>
+            {
+                b.ClearProviders();
+                b.SetMinimumLevel(enableDebug ? LogLevel.Debug : LogLevel.None);
+                b.AddProvider(new SpectreConsoleLoggerProvider());
+            });
+
+            var services = sc.BuildServiceProvider();
+            var loggerFactory = services.GetRequiredService<ILoggerFactory>();
+
+            var orchestratorAgentLogger = loggerFactory.CreateLogger("OrchestratorAgent");
+            var specializedAgentLogger = loggerFactory.CreateLogger("SpecializedAgent");
+
+            AnsiConsole.WriteLine("Connecting to MCP server...");
+            AnsiConsole.WriteLine($"MCP Server URL: {mcpServerUrl}");
+            await mcpClient.InitializeAsync();
+            AnsiConsole.WriteLine("MCP session established.");
+
+            AnsiConsole.WriteLine("Introspecting GraphQL schema...");
+            var schemaJson = await mcpClient.CallToolAsync("introspect-schema");
+            var schemaSummary = ExtractSchemaSummary(schemaJson);
+            AnsiConsole.WriteLine("Schema introspection completed.");
+
+            AnsiConsole.WriteLine("Initializing specialized agents...");
+            var kernel = services.GetRequiredService<Kernel>();
+            kernel.Plugins.AddFromObject(new GraphQLAgent(mcpClient, specializedAgentLogger));
+
+            foreach (var p in kernel.Plugins)
+            {
+                foreach (var f in p.GetFunctionsMetadata())
+                {
+                    AnsiConsole.WriteLine($"Agent: {p.Name}, Tool: {f.Name}");
+                }
+            }
+            var ai = kernel.GetRequiredService<IChatCompletionService>();
+
+            AnsiConsole.WriteLine("All done.");
+
+            return (orchestratorAgentLogger, kernel, ai, schemaSummary);
+        });
+
+        AnsiConsole.WriteLine("Ready to chat! Hit 'ctrl-c' to quit.");
+        var chat = new ChatHistory($"""
+            You are an AI assistant that helps users query data via a GraphQL API.
+            The API exposes the following queries:
+ 
+            {schemaSummary}
+ 
+            Use a professional tone when answering and provide a summary of data instead of lists.
+            If users ask about topics you don't know, answer that you don't know. Today's date is {DateTime.Now:yyyy-MM-dd}.
+            You must use the provided QueryGraphQL tool to query the GraphQL API with valid GraphQL query strings.
+            If you need more details about the schema structure or available fields, use the IntrospectSchema tool.
+            If the request is complex, break it down into smaller steps and call the QueryGraphQL tool as many times as needed.
+        """);
+        var builder = new StringBuilder();
+        while (true)
+        {
+            AnsiConsole.WriteLine();
+            var question = AnsiConsole.Prompt(new TextPrompt<string>($"🧑: "));
+
+            if (string.IsNullOrWhiteSpace(question))
+                continue;
+
+            switch (question)
+            {
+                case "/c":
+                    AnsiConsole.Clear();
+                    continue;
+                case "/ch":
+                    chat.RemoveRange(1, chat.Count - 1);
+                    AnsiConsole.WriteLine("Chat history cleared.");
+                    continue;
+                case "/h":
+                    foreach (var message in chat)
+                    {
+                        AnsiConsole.WriteLine($"> ---------- {message.Role} ----------");
+                        AnsiConsole.WriteLine($"> MESSAGE  > {message.Content}");
+                        AnsiConsole.WriteLine($"> METADATA > {JsonSerializer.Serialize(message.Metadata)}");
+                        AnsiConsole.WriteLine($"> ------------------------------------");
+                    }
+                    continue;
+            }
+
+            AnsiConsole.WriteLine();
+            AnsiConsole.WriteLine("🤖: Formulating answer...");
+            builder.Clear();
+            chat.AddUserMessage(question);
+            var firstLine = true;
+            await foreach (var message in ai.GetStreamingChatMessageContentsAsync(chat, openAIPromptExecutionSettings, kernel))
+            {
+                if (!enableDebug)
+                    if (firstLine && message.Content != null && message.Content.Length > 0)
+                    {
+                        AnsiConsole.Cursor.MoveUp();
+                        AnsiConsole.WriteLine("                                  ");
+                        AnsiConsole.Cursor.MoveUp();
+                        AnsiConsole.Write($"🤖: ");
+                        firstLine = false;
+                    }
+                AnsiConsole.Write(message.Content ?? string.Empty);
+                builder.Append(message.Content);
+            }
+            AnsiConsole.WriteLine();
+
+            chat.AddAssistantMessage(builder.ToString());
+        }
+    }
+
+    private static string ExtractSchemaSummary(string schemaJson)
+    {
+        try
+        {
+            var doc = JsonDocument.Parse(schemaJson);
+            var root = doc.RootElement;
+
+            JsonElement schema;
+            if (root.TryGetProperty("data", out var data) && data.TryGetProperty("__schema", out schema))
+            { }
+            else if (root.TryGetProperty("__schema", out schema))
+            { }
+            else
+            {
+                return schemaJson;
+            }
+
+            var queryTypeName = schema.GetProperty("queryType").GetProperty("name").GetString();
+            var mutationTypeName = schema.TryGetProperty("mutationType", out var mt) && mt.ValueKind != JsonValueKind.Null
+                ? mt.GetProperty("name").GetString()
+                : null;
+
+            var types = schema.GetProperty("types");
+            var sb = new StringBuilder();
+
+            foreach (var type in types.EnumerateArray())
+            {
+                var typeName = type.GetProperty("name").GetString();
+                if (typeName == null || typeName.StartsWith("__"))
+                    continue;
+
+                bool isQuery = typeName == queryTypeName;
+                bool isMutation = typeName == mutationTypeName;
+
+                if ((isQuery || isMutation) && type.TryGetProperty("fields", out var fields) && fields.ValueKind == JsonValueKind.Array)
+                {
+                    sb.AppendLine(isQuery ? "## Available Queries:" : "## Available Mutations:");
+
+                    foreach (var field in fields.EnumerateArray())
+                    {
+                        var fieldName = field.GetProperty("name").GetString();
+                        var description = field.TryGetProperty("description", out var desc) && desc.ValueKind == JsonValueKind.String
+                            ? desc.GetString()
+                            : null;
+
+                        sb.Append($"- {fieldName}");
+                        if (!string.IsNullOrEmpty(description))
+                            sb.Append($": {description}");
+
+                        if (field.TryGetProperty("args", out var args) && args.ValueKind == JsonValueKind.Array && args.GetArrayLength() > 0)
+                        {
+                            var argNames = new List<string>();
+                            foreach (var arg in args.EnumerateArray())
+                            {
+                                var argName = arg.GetProperty("name").GetString();
+                                if (argName != null)
+                                    argNames.Add(argName);
+                            }
+                            if (argNames.Count > 0)
+                                sb.Append($" (args: {string.Join(", ", argNames)})");
+                        }
+
+                        sb.AppendLine();
+                    }
+                    sb.AppendLine();
+                }
+            }
+
+            var summary = sb.ToString();
+            return string.IsNullOrWhiteSpace(summary) ? schemaJson : summary;
+        }
+        catch
+        {
+            return schemaJson;
+        }
+    }
+}
