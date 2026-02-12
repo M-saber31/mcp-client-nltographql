@@ -155,23 +155,54 @@ public class ChatBot
             builder.Clear();
             chat.AddUserMessage(question);
             var firstLine = true;
-            await foreach (var message in ai.GetStreamingChatMessageContentsAsync(chat, openAIPromptExecutionSettings, kernel))
-            {
-                if (!enableDebug)
-                    if (firstLine && message.Content != null && message.Content.Length > 0)
-                    {
-                        AnsiConsole.Cursor.MoveUp();
-                        AnsiConsole.WriteLine("                                  ");
-                        AnsiConsole.Cursor.MoveUp();
-                        AnsiConsole.Write($"🤖: ");
-                        firstLine = false;
-                    }
-                AnsiConsole.Write(message.Content ?? string.Empty);
-                builder.Append(message.Content);
-            }
-            AnsiConsole.WriteLine();
+            var maxRetries = 5;
+            var succeeded = false;
 
-            chat.AddAssistantMessage(builder.ToString());
+            for (int attempt = 0; attempt < maxRetries && !succeeded; attempt++)
+            {
+                try
+                {
+                    if (attempt > 0)
+                    {
+                        AnsiConsole.MarkupLine($"[yellow]🔄 Retry attempt {attempt}/{maxRetries - 1}...[/]");
+                        firstLine = true;
+                        builder.Clear();
+                    }
+
+                    await foreach (var message in ai.GetStreamingChatMessageContentsAsync(chat, openAIPromptExecutionSettings, kernel))
+                    {
+                        if (!enableDebug)
+                            if (firstLine && message.Content != null && message.Content.Length > 0)
+                            {
+                                AnsiConsole.Cursor.MoveUp();
+                                AnsiConsole.WriteLine("                                  ");
+                                AnsiConsole.Cursor.MoveUp();
+                                AnsiConsole.Write($"🤖: ");
+                                firstLine = false;
+                            }
+                        AnsiConsole.Write(message.Content ?? string.Empty);
+                        builder.Append(message.Content);
+                    }
+                    succeeded = true;
+                }
+                catch (HttpOperationException ex) when (ex.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                {
+                    var waitSeconds = (int)Math.Pow(2, attempt) * 15;
+                    AnsiConsole.MarkupLine($"[yellow]⚠️ Rate limit hit. Waiting {waitSeconds} seconds before retrying...[/]");
+                    await Task.Delay(TimeSpan.FromSeconds(waitSeconds));
+                }
+            }
+
+            if (!succeeded)
+            {
+                AnsiConsole.MarkupLine("[red]❌ Failed after all retry attempts. Try again later.[/]");
+                chat.RemoveAt(chat.Count - 1);
+            }
+            else
+            {
+                AnsiConsole.WriteLine();
+                chat.AddAssistantMessage(builder.ToString());
+            }
         }
     }
 
