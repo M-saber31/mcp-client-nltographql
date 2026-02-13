@@ -122,6 +122,11 @@ public class ChatBot
             If the request is complex, break it down into smaller steps and call the QueryGraphQL tool as many times as needed.
         """);
         var builder = new StringBuilder();
+        long sessionPromptTokens = 0;
+        long sessionCompletionTokens = 0;
+        long sessionTotalTokens = 0;
+        int requestCount = 0;
+
         while (true)
         {
             AnsiConsole.WriteLine();
@@ -137,7 +142,11 @@ public class ChatBot
                     continue;
                 case "/ch":
                     chat.RemoveRange(1, chat.Count - 1);
-                    AnsiConsole.WriteLine("Chat history cleared.");
+                    sessionPromptTokens = 0;
+                    sessionCompletionTokens = 0;
+                    sessionTotalTokens = 0;
+                    requestCount = 0;
+                    AnsiConsole.WriteLine("Chat history and token counters cleared.");
                     continue;
                 case "/h":
                     foreach (var message in chat)
@@ -148,6 +157,19 @@ public class ChatBot
                         AnsiConsole.WriteLine($"> ------------------------------------");
                     }
                     continue;
+                case "/tokens":
+                    var historyChars = chat.Sum(m => m.Content?.Length ?? 0);
+                    var estimatedHistoryTokens = historyChars / 4;
+                    AnsiConsole.MarkupLine($"[cyan]📊 Token Usage Report[/]");
+                    AnsiConsole.MarkupLine($"[cyan]   Requests made:          {requestCount}[/]");
+                    AnsiConsole.MarkupLine($"[cyan]   Session prompt tokens:   {sessionPromptTokens:N0}[/]");
+                    AnsiConsole.MarkupLine($"[cyan]   Session completion tokens:{sessionCompletionTokens:N0}[/]");
+                    AnsiConsole.MarkupLine($"[cyan]   Session total tokens:    {sessionTotalTokens:N0}[/]");
+                    AnsiConsole.MarkupLine($"[cyan]   Chat history messages:   {chat.Count}[/]");
+                    AnsiConsole.MarkupLine($"[cyan]   Chat history chars:      {historyChars:N0}[/]");
+                    AnsiConsole.MarkupLine($"[cyan]   Est. history tokens:     ~{estimatedHistoryTokens:N0}[/]");
+                    AnsiConsole.MarkupLine($"[cyan]   Rate limit (S0 tier):    200,000 TPM[/]");
+                    continue;
             }
 
             AnsiConsole.WriteLine();
@@ -157,6 +179,9 @@ public class ChatBot
             var firstLine = true;
             var maxRetries = 5;
             var succeeded = false;
+            long reqPromptTokens = 0;
+            long reqCompletionTokens = 0;
+            long reqTotalTokens = 0;
 
             for (int attempt = 0; attempt < maxRetries && !succeeded; attempt++)
             {
@@ -182,6 +207,22 @@ public class ChatBot
                             }
                         AnsiConsole.Write(message.Content ?? string.Empty);
                         builder.Append(message.Content);
+
+                        if (message.Metadata != null)
+                        {
+                            if (message.Metadata.TryGetValue("Usage", out var usage) && usage != null)
+                            {
+                                var usageJson = JsonSerializer.Serialize(usage);
+                                var usageDoc = JsonDocument.Parse(usageJson);
+                                var root = usageDoc.RootElement;
+                                if (root.TryGetProperty("PromptTokens", out var pt))
+                                    reqPromptTokens = pt.GetInt64();
+                                if (root.TryGetProperty("CompletionTokens", out var ct))
+                                    reqCompletionTokens = ct.GetInt64();
+                                if (root.TryGetProperty("TotalTokens", out var tt))
+                                    reqTotalTokens = tt.GetInt64();
+                            }
+                        }
                     }
                     succeeded = true;
                 }
@@ -202,6 +243,13 @@ public class ChatBot
             {
                 AnsiConsole.WriteLine();
                 chat.AddAssistantMessage(builder.ToString());
+
+                requestCount++;
+                sessionPromptTokens += reqPromptTokens;
+                sessionCompletionTokens += reqCompletionTokens;
+                sessionTotalTokens += reqTotalTokens;
+
+                AnsiConsole.MarkupLine($"[grey]📊 This request: prompt={reqPromptTokens:N0} completion={reqCompletionTokens:N0} total={reqTotalTokens:N0} | Session total: {sessionTotalTokens:N0}/200,000 TPM[/]");
             }
         }
     }
