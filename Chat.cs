@@ -1,21 +1,20 @@
 using System.Text;
 using System.Text.Json;
-using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
-using Microsoft.SemanticKernel.Connectors.AzureOpenAI;
+using Microsoft.Agents.AI;
+using Azure.AI.OpenAI;
+using Azure.Identity;
+using OpenAI.Chat;
+using ModelContextProtocol.Client;
 using DotNetEnv;
 using Spectre.Console;
-using Azure.Identity;
-
-#pragma warning disable SKEXP0001, SKEXP0010, SKEXP0020
 
 namespace Samples.Azure.Database.NL2SQL;
 
 public class ChatBot
 {
-    const string VERSION = "2.0";
+    const string VERSION = "3.0";
     private readonly string azureOpenAIEndpoint;
     private readonly string azureOpenAIApiKey;
     private readonly string chatModelDeploymentName;
@@ -40,138 +39,136 @@ public class ChatBot
         table.AddColumn(new TableColumn($"[bold]Natural Language GraphQL Chatbot Agent[/] v{VERSION}").Centered());
         AnsiConsole.Write(table);
 
-        using var mcpClient = new McpClient(mcpServerUrl);
-
-        var openAIPromptExecutionSettings = new AzureOpenAIPromptExecutionSettings()
+        var loggerFactory = LoggerFactory.Create(b =>
         {
-            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto()
-        };
+            b.ClearProviders();
+            b.SetMinimumLevel(enableDebug ? LogLevel.Debug : LogLevel.None);
+            b.AddProvider(new SpectreConsoleLoggerProvider());
+        });
 
-        (var logger, var kernel, var ai, var schemaSummary) = await AnsiConsole.Status().StartAsync("Booting up agents...", async ctx =>
+        (var agent, var mcpClient, var session) = await AnsiConsole.Status().StartAsync("Booting up agents...", async ctx =>
         {
-            AnsiConsole.WriteLine("Initializing orchestrator agent...");
             ctx.Spinner(Spinner.Known.Default);
             ctx.SpinnerStyle(Style.Parse("yellow"));
 
-            AnsiConsole.WriteLine("Initializing kernel...");
-            var credentials = new DefaultAzureCredential();
-            var sc = new ServiceCollection();
+            // Connect to MCP server
+            AnsiConsole.WriteLine("Connecting to MCP server...");
+            AnsiConsole.WriteLine($"MCP Server URL: {mcpServerUrl}");
 
-            if (string.IsNullOrEmpty(azureOpenAIApiKey))
+            var transport = new SseClientTransport(new SseClientTransportOptions
             {
-                sc.AddAzureOpenAIChatCompletion(chatModelDeploymentName, azureOpenAIEndpoint, credentials);
+                Endpoint = new Uri(mcpServerUrl),
+                Name = "nl2graphql-mcp-server",
+                TransportMode = HttpTransportMode.AutoDetect
+            }, loggerFactory: loggerFactory);
+
+            var mcpClient = await McpClientFactory.CreateAsync(transport, loggerFactory: loggerFactory);
+            AnsiConsole.WriteLine("MCP session established.");
+
+            // Discover MCP tools
+            AnsiConsole.WriteLine("Discovering MCP tools...");
+            var mcpTools = await mcpClient.ListToolsAsync();
+            foreach (var tool in mcpTools)
+            {
+                AnsiConsole.WriteLine($"  Tool: {tool.Name} - {tool.Description}");
+            }
+
+            // Introspect schema for the system prompt
+            AnsiConsole.WriteLine("Introspecting GraphQL schema...");
+            var introspectTool = mcpTools.FirstOrDefault(t => t.Name == "introspect-schema");
+            string schemaSummary;
+            if (introspectTool != null)
+            {
+                var schemaResult = await mcpClient.CallToolAsync("introspect-schema");
+                var schemaJson = schemaResult.Content
+                    .Where(c => c.Type == "text")
+                    .Select(c => c.Text)
+                    .FirstOrDefault() ?? string.Empty;
+                schemaSummary = ExtractSchemaSummary(schemaJson);
             }
             else
             {
-                sc.AddAzureOpenAIChatCompletion(chatModelDeploymentName, azureOpenAIEndpoint, azureOpenAIApiKey);
+                schemaSummary = "Schema not available - use introspection tools if needed.";
             }
-
-            sc.AddKernel();
-            sc.AddLogging(b =>
-            {
-                b.ClearProviders();
-                b.SetMinimumLevel(enableDebug ? LogLevel.Debug : LogLevel.None);
-                b.AddProvider(new SpectreConsoleLoggerProvider());
-            });
-
-            var services = sc.BuildServiceProvider();
-            var loggerFactory = services.GetRequiredService<ILoggerFactory>();
-
-            var orchestratorAgentLogger = loggerFactory.CreateLogger("OrchestratorAgent");
-            var specializedAgentLogger = loggerFactory.CreateLogger("SpecializedAgent");
-
-            AnsiConsole.WriteLine("Connecting to MCP server...");
-            AnsiConsole.WriteLine($"MCP Server URL: {mcpServerUrl}");
-            await mcpClient.InitializeAsync();
-            AnsiConsole.WriteLine("MCP session established.");
-
-            AnsiConsole.WriteLine("Introspecting GraphQL schema...");
-            var schemaJson = await mcpClient.CallToolAsync("introspect-schema");
-            var schemaSummary = ExtractSchemaSummary(schemaJson);
             AnsiConsole.WriteLine("Schema introspection completed.");
 
-            AnsiConsole.WriteLine("Initializing specialized agents...");
-            var kernel = services.GetRequiredService<Kernel>();
-            kernel.Plugins.AddFromObject(new GraphQLAgent(mcpClient, specializedAgentLogger));
+            // Create the Azure OpenAI agent with MCP tools and schema baked into instructions
+            AnsiConsole.WriteLine("Initializing agent...");
 
-            foreach (var p in kernel.Plugins)
-            {
-                foreach (var f in p.GetFunctionsMetadata())
-                {
-                    AnsiConsole.WriteLine($"Agent: {p.Name}, Tool: {f.Name}");
-                }
-            }
-            var ai = kernel.GetRequiredService<IChatCompletionService>();
+            var azureClient = string.IsNullOrEmpty(azureOpenAIApiKey)
+                ? new AzureOpenAIClient(new Uri(azureOpenAIEndpoint), new DefaultAzureCredential())
+                : new AzureOpenAIClient(new Uri(azureOpenAIEndpoint), new System.ClientModel.ApiKeyCredential(azureOpenAIApiKey));
+
+            var chatClient = azureClient.GetChatClient(chatModelDeploymentName);
+
+            var agent = chatClient.AsAIAgent(
+                instructions: $"""
+                    You are an AI assistant that helps users query data via a GraphQL API.
+                    The API exposes the following queries:
+
+                    {schemaSummary}
+
+                    Use a professional tone when answering and provide a summary of data instead of lists.
+                    If users ask about topics you don't know, answer that you don't know. Today's date is {DateTime.Now:yyyy-MM-dd}.
+                    You must use the provided query-graphql tool to query the GraphQL API with valid GraphQL query strings.
+                    If you need more details about the schema structure or available fields, use the introspect-schema tool.
+                    If the request is complex, break it down into smaller steps and call the query-graphql tool as many times as needed.
+                    """,
+                name: "GraphQLAssistant",
+                tools: new List<AITool>(mcpTools),
+                loggerFactory: loggerFactory
+            );
+
+            // Create a session to manage conversation state
+            var session = await agent.CreateSessionAsync();
 
             AnsiConsole.WriteLine("All done.");
-
-            return (orchestratorAgentLogger, kernel, ai, schemaSummary);
+            return (agent, mcpClient, session);
         });
 
         AnsiConsole.WriteLine("Ready to chat! Hit 'ctrl-c' to quit.");
-        var chat = new ChatHistory($"""
-            You are an AI assistant that helps users query data via a GraphQL API.
-            The API exposes the following queries:
- 
-            {schemaSummary}
- 
-            Use a professional tone when answering and provide a summary of data instead of lists.
-            If users ask about topics you don't know, answer that you don't know. Today's date is {DateTime.Now:yyyy-MM-dd}.
-            You must use the provided QueryGraphQL tool to query the GraphQL API with valid GraphQL query strings.
-            If you need more details about the schema structure or available fields, use the IntrospectSchema tool.
-            If the request is complex, break it down into smaller steps and call the QueryGraphQL tool as many times as needed.
-        """);
-        var builder = new StringBuilder();
-        while (true)
+
+        try
         {
-            AnsiConsole.WriteLine();
-            var question = AnsiConsole.Prompt(new TextPrompt<string>($"🧑: "));
-
-            if (string.IsNullOrWhiteSpace(question))
-                continue;
-
-            switch (question)
+            while (true)
             {
-                case "/c":
-                    AnsiConsole.Clear();
-                    continue;
-                case "/ch":
-                    chat.RemoveRange(1, chat.Count - 1);
-                    AnsiConsole.WriteLine("Chat history cleared.");
-                    continue;
-                case "/h":
-                    foreach (var message in chat)
-                    {
-                        AnsiConsole.WriteLine($"> ---------- {message.Role} ----------");
-                        AnsiConsole.WriteLine($"> MESSAGE  > {message.Content}");
-                        AnsiConsole.WriteLine($"> METADATA > {JsonSerializer.Serialize(message.Metadata)}");
-                        AnsiConsole.WriteLine($"> ------------------------------------");
-                    }
-                    continue;
-            }
+                AnsiConsole.WriteLine();
+                var question = AnsiConsole.Prompt(new TextPrompt<string>($"🧑: "));
 
-            AnsiConsole.WriteLine();
-            AnsiConsole.WriteLine("🤖: Formulating answer...");
-            builder.Clear();
-            chat.AddUserMessage(question);
-            var firstLine = true;
-            await foreach (var message in ai.GetStreamingChatMessageContentsAsync(chat, openAIPromptExecutionSettings, kernel))
-            {
-                if (!enableDebug)
-                    if (firstLine && message.Content != null && message.Content.Length > 0)
-                    {
-                        AnsiConsole.Cursor.MoveUp();
-                        AnsiConsole.WriteLine("                                  ");
-                        AnsiConsole.Cursor.MoveUp();
-                        AnsiConsole.Write($"🤖: ");
-                        firstLine = false;
-                    }
-                AnsiConsole.Write(message.Content ?? string.Empty);
-                builder.Append(message.Content);
-            }
-            AnsiConsole.WriteLine();
+                if (string.IsNullOrWhiteSpace(question))
+                    continue;
 
-            chat.AddAssistantMessage(builder.ToString());
+                switch (question)
+                {
+                    case "/c":
+                        AnsiConsole.Clear();
+                        continue;
+                    case "/ch":
+                        session = await agent.CreateSessionAsync();
+                        AnsiConsole.WriteLine("Chat history cleared (new session created).");
+                        continue;
+                }
+
+                AnsiConsole.WriteLine();
+                AnsiConsole.Write("🤖: ");
+
+                await foreach (var update in agent.RunStreamingAsync(question, session))
+                {
+                    var text = update.Text;
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        AnsiConsole.Write(text);
+                    }
+                }
+                AnsiConsole.WriteLine();
+            }
+        }
+        finally
+        {
+            if (mcpClient is IAsyncDisposable asyncDisposable)
+                await asyncDisposable.DisposeAsync();
+            else if (mcpClient is IDisposable disposable)
+                disposable.Dispose();
         }
     }
 
