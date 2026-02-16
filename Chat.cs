@@ -12,39 +12,6 @@ using Spectre.Console;
 
 namespace Samples.Azure.Database.NL2SQL;
 
-/// <summary>
-/// Wraps an AIFunction to truncate results that exceed a character limit.
-/// Prevents large GraphQL responses from bloating the chat history.
-/// </summary>
-public class TruncatedAIFunction : AIFunction
-{
-    private readonly AIFunction _inner;
-    private readonly int _maxResultLength;
-
-    public TruncatedAIFunction(AIFunction inner, int maxResultLength = 4000)
-    {
-        _inner = inner;
-        _maxResultLength = maxResultLength;
-    }
-
-    public override string Name => _inner.Name;
-    public override string Description => _inner.Description;
-    public override JsonElement JsonSchema => _inner.JsonSchema;
-    public override JsonSerializerOptions JsonSerializerOptions => _inner.JsonSerializerOptions;
-
-    protected override async ValueTask<object?> InvokeCoreAsync(
-        AIFunctionArguments arguments,
-        CancellationToken cancellationToken)
-    {
-        var result = await _inner.InvokeAsync(arguments, cancellationToken);
-        if (result is string text && text.Length > _maxResultLength)
-        {
-            return $"{text[.._maxResultLength]}\n... [truncated, {text.Length - _maxResultLength} chars omitted]";
-        }
-        return result;
-    }
-}
-
 public class ChatBot
 {
     const string VERSION = "3.0";
@@ -150,7 +117,7 @@ public class ChatBot
                     If the user needs aggregate data (counts, totals), prefer using available aggregate queries over fetching raw rows.
                     """,
                 name: "GraphQLAssistant",
-                tools: mcpTools.Select(t => (AITool)new TruncatedAIFunction(t, maxResultLength: 4000)).ToList(),
+                tools: new List<AITool>(mcpTools),
                 loggerFactory: loggerFactory
             );
 
@@ -182,6 +149,9 @@ public class ChatBot
                         session = await agent.CreateSessionAsync();
                         AnsiConsole.WriteLine("Chat history cleared (new session created).");
                         continue;
+                    case "/h":
+                        DisplaySessionContents(agent, session);
+                        continue;
                 }
 
                 AnsiConsole.WriteLine();
@@ -196,6 +166,10 @@ public class ChatBot
                     }
                 }
                 AnsiConsole.WriteLine();
+
+                // Remove tool call and tool result messages from session history
+                // to keep it lean — only user questions and assistant summaries are retained
+                StripToolMessagesFromSession(session);
             }
         }
         finally
@@ -205,6 +179,140 @@ public class ChatBot
             else if (mcpClient is IDisposable disposable)
                 disposable.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Removes all tool call and tool result messages from the session's chat history.
+    /// This keeps only user messages and assistant text responses, reducing token usage
+    /// on subsequent LLM calls.
+    /// </summary>
+    private static void StripToolMessagesFromSession(AgentSession session)
+    {
+        var provider = session.GetService<InMemoryChatHistoryProvider>();
+        if (provider == null) return;
+
+        for (int i = provider.Count - 1; i >= 0; i--)
+        {
+            var msg = provider[i];
+
+            // Remove messages with role "tool" (tool results)
+            if (msg.Role == ChatRole.Tool)
+            {
+                provider.RemoveAt(i);
+                continue;
+            }
+
+            // Remove assistant messages that contain tool call requests (no text content)
+            if (msg.Role == ChatRole.Assistant && msg.Contents != null)
+            {
+                bool hasToolCalls = msg.Contents.Any(c => c is FunctionCallContent);
+                bool hasTextContent = msg.Contents.Any(c => c is TextContent tc && !string.IsNullOrWhiteSpace(tc.Text));
+
+                // If it's purely tool calls with no text, remove it
+                if (hasToolCalls && !hasTextContent)
+                {
+                    provider.RemoveAt(i);
+                }
+                // If it has both tool calls and text, keep only the text
+                else if (hasToolCalls && hasTextContent)
+                {
+                    var textOnly = msg.Contents.Where(c => c is TextContent).ToList();
+                    provider[i] = new Microsoft.Extensions.AI.ChatMessage(ChatRole.Assistant, textOnly);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Displays the full contents of the AgentSession for inspection.
+    /// Shows the serialized JSON structure and a human-readable message breakdown.
+    /// </summary>
+    private static void DisplaySessionContents(ChatClientAgent agent, AgentSession session)
+    {
+        var provider = session.GetService<InMemoryChatHistoryProvider>();
+        if (provider == null)
+        {
+            AnsiConsole.MarkupLine("[red]Could not access session history provider.[/]");
+            return;
+        }
+
+        AnsiConsole.MarkupLine($"[bold yellow]--- Session Contents ({provider.Count} messages) ---[/]");
+        AnsiConsole.WriteLine();
+
+        for (int i = 0; i < provider.Count; i++)
+        {
+            var msg = provider[i];
+            var roleColor = msg.Role == ChatRole.User ? "green"
+                : msg.Role == ChatRole.Assistant ? "cyan"
+                : msg.Role == ChatRole.Tool ? "yellow"
+                : "white";
+
+            AnsiConsole.MarkupLine($"[bold {roleColor}]Message {i}: Role={msg.Role}[/]");
+
+            // Show content types
+            if (msg.Contents != null)
+            {
+                foreach (var content in msg.Contents)
+                {
+                    switch (content)
+                    {
+                        case TextContent tc:
+                            var preview = tc.Text?.Length > 200 ? tc.Text[..200] + "..." : tc.Text;
+                            AnsiConsole.MarkupLine($"  [grey]TextContent:[/] {Markup.Escape(preview ?? "(empty)")}");
+                            break;
+                        case FunctionCallContent fc:
+                            AnsiConsole.MarkupLine($"  [grey]FunctionCallContent:[/] {Markup.Escape(fc.Name ?? "?")}({Markup.Escape(JsonSerializer.Serialize(fc.Arguments))})");
+                            break;
+                        case FunctionResultContent fr:
+                            var resultPreview = fr.Result?.ToString();
+                            resultPreview = resultPreview?.Length > 200 ? resultPreview[..200] + "..." : resultPreview;
+                            AnsiConsole.MarkupLine($"  [grey]FunctionResultContent:[/] {Markup.Escape(resultPreview ?? "(empty)")}");
+                            break;
+                        default:
+                            AnsiConsole.MarkupLine($"  [grey]{content.GetType().Name}[/]");
+                            break;
+                    }
+                }
+            }
+
+            // Show metadata/additional properties
+            if (msg.AdditionalProperties?.Count > 0)
+            {
+                AnsiConsole.MarkupLine($"  [grey]AdditionalProperties:[/] {Markup.Escape(JsonSerializer.Serialize(msg.AdditionalProperties))}");
+            }
+
+            AnsiConsole.WriteLine();
+        }
+
+        // Show what SQL Server columns you'd need
+        AnsiConsole.MarkupLine("[bold yellow]--- SQL Server Schema Recommendation ---[/]");
+        AnsiConsole.MarkupLine("""
+        [grey]Based on the session structure, here are the fields you'd store:
+
+        CREATE TABLE ChatMessages (
+            Id              INT IDENTITY PRIMARY KEY,
+            SessionId       NVARCHAR(100) NOT NULL,     -- links messages to a session
+            UserId          NVARCHAR(100) NOT NULL,     -- links session to a user
+            MessageIndex    INT NOT NULL,                -- ordering within session
+            Role            NVARCHAR(20) NOT NULL,      -- 'user', 'assistant'
+            TextContent     NVARCHAR(MAX),              -- the actual message text
+            CreatedAt       DATETIME2 DEFAULT GETDATE(),
+
+            INDEX IX_Session (SessionId, MessageIndex)
+        );
+
+        CREATE TABLE ChatSessions (
+            SessionId       NVARCHAR(100) PRIMARY KEY,
+            UserId          NVARCHAR(100) NOT NULL,
+            CreatedAt       DATETIME2 DEFAULT GETDATE(),
+            LastMessageAt   DATETIME2,
+
+            INDEX IX_User (UserId)
+        );
+        [/]
+        """);
+
+        AnsiConsole.MarkupLine("[bold yellow]---------------------------------------[/]");
     }
 
     private static string ExtractSchemaSummary(string schemaJson)
