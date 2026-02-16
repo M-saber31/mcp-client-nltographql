@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.AI;
@@ -11,6 +12,88 @@ using DotNetEnv;
 using Spectre.Console;
 
 namespace Samples.Azure.Database.NL2SQL;
+
+/// <summary>
+/// Wraps an AIFunction to measure and log execution time of each tool call.
+/// </summary>
+public class TimedAIFunction : AIFunction
+{
+    private readonly AIFunction _inner;
+
+    public TimedAIFunction(AIFunction inner) => _inner = inner;
+
+    public override string Name => _inner.Name;
+    public override string Description => _inner.Description;
+    public override JsonElement JsonSchema => _inner.JsonSchema;
+    public override JsonSerializerOptions JsonSerializerOptions => _inner.JsonSerializerOptions;
+
+    protected override async ValueTask<object?> InvokeCoreAsync(
+        AIFunctionArguments arguments,
+        CancellationToken cancellationToken)
+    {
+        var sw = Stopwatch.StartNew();
+        var result = await _inner.InvokeAsync(arguments, cancellationToken);
+        sw.Stop();
+        AnsiConsole.MarkupLine($"  [yellow]>> Tool '{Markup.Escape(Name)}' completed in {sw.Elapsed.TotalSeconds:F2}s[/]");
+        return result;
+    }
+}
+
+/// <summary>
+/// IChatClient middleware that measures and logs the duration of each LLM API call.
+/// </summary>
+public class TimingChatClient : DelegatingChatClient
+{
+    private int _callIndex = 0;
+
+    public TimingChatClient(IChatClient inner) : base(inner) { }
+
+    public override async Task<Microsoft.Extensions.AI.ChatResponse> GetResponseAsync(
+        IEnumerable<Microsoft.Extensions.AI.ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var callNum = Interlocked.Increment(ref _callIndex);
+        var messageCount = messages.Count();
+        var sw = Stopwatch.StartNew();
+        AnsiConsole.MarkupLine($"  [blue]>> LLM call #{callNum} started ({messageCount} messages in history)...[/]");
+
+        var response = await base.GetResponseAsync(messages, options, cancellationToken);
+        sw.Stop();
+
+        var hasToolCalls = response.Messages
+            .SelectMany(m => m.Contents)
+            .Any(c => c is FunctionCallContent);
+        var label = hasToolCalls ? "tool call request" : "text response";
+
+        AnsiConsole.MarkupLine($"  [blue]>> LLM call #{callNum} completed in {sw.Elapsed.TotalSeconds:F2}s ({label})[/]");
+        return response;
+    }
+
+    public override async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<Microsoft.Extensions.AI.ChatMessage> messages,
+        ChatOptions? options = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var callNum = Interlocked.Increment(ref _callIndex);
+        var messageCount = messages.Count();
+        var sw = Stopwatch.StartNew();
+        var firstToken = true;
+        AnsiConsole.MarkupLine($"  [blue]>> LLM call #{callNum} started ({messageCount} messages in history)...[/]");
+
+        await foreach (var update in base.GetStreamingResponseAsync(messages, options, cancellationToken))
+        {
+            if (firstToken && sw.IsRunning)
+            {
+                AnsiConsole.MarkupLine($"  [blue]>> LLM call #{callNum} first token in {sw.Elapsed.TotalSeconds:F2}s[/]");
+                firstToken = false;
+            }
+            yield return update;
+        }
+        sw.Stop();
+        AnsiConsole.MarkupLine($"  [blue]>> LLM call #{callNum} stream completed in {sw.Elapsed.TotalSeconds:F2}s[/]");
+    }
+}
 
 public class ChatBot
 {
@@ -51,6 +134,8 @@ public class ChatBot
             ctx.Spinner(Spinner.Known.Default);
             ctx.SpinnerStyle(Style.Parse("yellow"));
 
+            var sw = Stopwatch.StartNew();
+
             // Connect to MCP server
             AnsiConsole.WriteLine("Connecting to MCP server...");
             AnsiConsole.WriteLine($"MCP Server URL: {mcpServerUrl}");
@@ -63,7 +148,8 @@ public class ChatBot
             }, loggerFactory: loggerFactory);
 
             var mcpClient = await McpClientFactory.CreateAsync(transport, loggerFactory: loggerFactory);
-            AnsiConsole.WriteLine("MCP session established.");
+            AnsiConsole.MarkupLine($"[yellow]MCP session established. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
+            sw.Restart();
 
             // Discover MCP tools
             AnsiConsole.WriteLine("Discovering MCP tools...");
@@ -72,6 +158,8 @@ public class ChatBot
             {
                 AnsiConsole.WriteLine($"  Tool: {tool.Name} - {tool.Description}");
             }
+            AnsiConsole.MarkupLine($"[yellow]Tool discovery completed. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
+            sw.Restart();
 
             // Introspect schema for the system prompt
             AnsiConsole.WriteLine("Introspecting GraphQL schema...");
@@ -90,7 +178,8 @@ public class ChatBot
             {
                 schemaSummary = "Schema not available - use introspection tools if needed.";
             }
-            AnsiConsole.WriteLine("Schema introspection completed.");
+            AnsiConsole.MarkupLine($"[yellow]Schema introspection completed. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
+            sw.Restart();
 
             // Create the Azure OpenAI agent with MCP tools and schema baked into instructions
             AnsiConsole.WriteLine("Initializing agent...");
@@ -117,9 +206,12 @@ public class ChatBot
                     If the user needs aggregate data (counts, totals), prefer using available aggregate queries over fetching raw rows.
                     """,
                 name: "GraphQLAssistant",
-                tools: new List<AITool>(mcpTools),
+                tools: mcpTools.Select(t => (AITool)new TimedAIFunction(t)).ToList(),
+                clientFactory: inner => new TimingChatClient(inner),
                 loggerFactory: loggerFactory
             );
+
+            AnsiConsole.MarkupLine($"[yellow]Agent initialized. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
 
             // Create a session to manage conversation state
             var session = await agent.CreateSessionAsync();
@@ -155,6 +247,8 @@ public class ChatBot
                 }
 
                 AnsiConsole.WriteLine();
+
+                var turnSw = Stopwatch.StartNew();
                 AnsiConsole.Write("🤖: ");
 
                 await foreach (var update in agent.RunStreamingAsync(question, session))
@@ -165,7 +259,9 @@ public class ChatBot
                         AnsiConsole.Write(text);
                     }
                 }
+                turnSw.Stop();
                 AnsiConsole.WriteLine();
+                AnsiConsole.MarkupLine($"[yellow]>> Total turn time: {turnSw.Elapsed.TotalSeconds:F2}s[/]");
 
                 // Remove tool call and tool result messages from session history
                 // to keep it lean — only user questions and assistant summaries are retained
