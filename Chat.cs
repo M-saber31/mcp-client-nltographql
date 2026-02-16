@@ -42,7 +42,7 @@ public class ChatBot
         var loggerFactory = LoggerFactory.Create(b =>
         {
             b.ClearProviders();
-            b.SetMinimumLevel(enableDebug ? LogLevel.Debug : LogLevel.None);
+            b.SetMinimumLevel(enableDebug ? LogLevel.Trace : LogLevel.None);
             b.AddProvider(new SpectreConsoleLoggerProvider());
         });
 
