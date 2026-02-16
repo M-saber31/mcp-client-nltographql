@@ -14,13 +14,20 @@ using Spectre.Console;
 namespace Samples.Azure.Database.NL2SQL;
 
 /// <summary>
-/// Wraps an AIFunction to measure and log execution time of each tool call.
+/// Wraps an AIFunction to measure execution time and truncate large results.
+/// Truncation happens BEFORE the result is sent back to the LLM, reducing
+/// the token count the LLM must process on the current turn.
 /// </summary>
 public class TimedAIFunction : AIFunction
 {
     private readonly AIFunction _inner;
+    private readonly int _maxResultLength;
 
-    public TimedAIFunction(AIFunction inner) => _inner = inner;
+    public TimedAIFunction(AIFunction inner, int maxResultLength = 8000)
+    {
+        _inner = inner;
+        _maxResultLength = maxResultLength;
+    }
 
     public override string Name => _inner.Name;
     public override string Description => _inner.Description;
@@ -34,7 +41,19 @@ public class TimedAIFunction : AIFunction
         var sw = Stopwatch.StartNew();
         var result = await _inner.InvokeAsync(arguments, cancellationToken);
         sw.Stop();
-        AnsiConsole.MarkupLine($"  [yellow]>> Tool '{Markup.Escape(Name)}' completed in {sw.Elapsed.TotalSeconds:F2}s[/]");
+
+        var resultStr = result?.ToString() ?? "";
+        var originalLength = resultStr.Length;
+        if (resultStr.Length > _maxResultLength)
+        {
+            result = $"{resultStr[.._maxResultLength]}\n... [truncated, showing {_maxResultLength} of {originalLength} chars. Ask user to narrow their query if more detail is needed.]";
+            AnsiConsole.MarkupLine($"  [yellow]>> Tool '{Markup.Escape(Name)}' completed in {sw.Elapsed.TotalSeconds:F2}s (result truncated: {originalLength} -> {_maxResultLength} chars)[/]");
+        }
+        else
+        {
+            AnsiConsole.MarkupLine($"  [yellow]>> Tool '{Markup.Escape(Name)}' completed in {sw.Elapsed.TotalSeconds:F2}s ({originalLength} chars)[/]");
+        }
+
         return result;
     }
 }
@@ -200,13 +219,16 @@ public class ChatBot
                     Use a professional tone when answering and provide a summary of data instead of lists.
                     If users ask about topics you don't know, answer that you don't know. Today's date is {DateTime.Now:yyyy-MM-dd}.
                     You must use the provided query-graphql tool to query the GraphQL API with valid GraphQL query strings.
-                    If you need more details about the schema structure or available fields, use the introspect-schema tool.
+                    The schema above is complete — do NOT call introspect-schema, it is not available as a tool.
                     IMPORTANT: Always use pagination arguments (e.g. first: 20) to limit query results. Never fetch all rows at once.
                     Only request the specific fields needed to answer the user's question — do not select all fields.
                     If the user needs aggregate data (counts, totals), prefer using available aggregate queries over fetching raw rows.
                     """,
                 name: "GraphQLAssistant",
-                tools: mcpTools.Select(t => (AITool)new TimedAIFunction(t)).ToList(),
+                tools: mcpTools
+                    .Where(t => t.Name != "introspect-schema")
+                    .Select(t => (AITool)new TimedAIFunction(t))
+                    .ToList(),
                 clientFactory: inner => new TimingChatClient(inner),
                 loggerFactory: loggerFactory
             );
