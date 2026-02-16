@@ -12,6 +12,39 @@ using Spectre.Console;
 
 namespace Samples.Azure.Database.NL2SQL;
 
+/// <summary>
+/// Wraps an AIFunction to truncate results that exceed a character limit.
+/// Prevents large GraphQL responses from bloating the chat history.
+/// </summary>
+public class TruncatedAIFunction : AIFunction
+{
+    private readonly AIFunction _inner;
+    private readonly int _maxResultLength;
+
+    public TruncatedAIFunction(AIFunction inner, int maxResultLength = 4000)
+    {
+        _inner = inner;
+        _maxResultLength = maxResultLength;
+    }
+
+    public override string Name => _inner.Name;
+    public override string Description => _inner.Description;
+    public override JsonElement JsonSchema => _inner.JsonSchema;
+    public override JsonSerializerOptions JsonSerializerOptions => _inner.JsonSerializerOptions;
+
+    protected override async ValueTask<object?> InvokeCoreAsync(
+        AIFunctionArguments arguments,
+        CancellationToken cancellationToken)
+    {
+        var result = await _inner.InvokeAsync(arguments, cancellationToken);
+        if (result is string text && text.Length > _maxResultLength)
+        {
+            return $"{text[.._maxResultLength]}\n... [truncated, {text.Length - _maxResultLength} chars omitted]";
+        }
+        return result;
+    }
+}
+
 public class ChatBot
 {
     const string VERSION = "3.0";
@@ -112,10 +145,12 @@ public class ChatBot
                     If users ask about topics you don't know, answer that you don't know. Today's date is {DateTime.Now:yyyy-MM-dd}.
                     You must use the provided query-graphql tool to query the GraphQL API with valid GraphQL query strings.
                     If you need more details about the schema structure or available fields, use the introspect-schema tool.
-                    If the request is complex, break it down into smaller steps and call the query-graphql tool as many times as needed.
+                    IMPORTANT: Always use pagination arguments (e.g. first: 20) to limit query results. Never fetch all rows at once.
+                    Only request the specific fields needed to answer the user's question — do not select all fields.
+                    If the user needs aggregate data (counts, totals), prefer using available aggregate queries over fetching raw rows.
                     """,
                 name: "GraphQLAssistant",
-                tools: new List<AITool>(mcpTools),
+                tools: mcpTools.Select(t => (AITool)new TruncatedAIFunction(t, maxResultLength: 4000)).ToList(),
                 loggerFactory: loggerFactory
             );
 
