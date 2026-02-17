@@ -21,13 +21,8 @@ namespace Samples.Azure.Database.NL2SQL;
 public class TimedAIFunction : AIFunction
 {
     private readonly AIFunction _inner;
-    private readonly int _maxResultLength;
 
-    public TimedAIFunction(AIFunction inner, int maxResultLength = 8000)
-    {
-        _inner = inner;
-        _maxResultLength = maxResultLength;
-    }
+    public TimedAIFunction(AIFunction inner) => _inner = inner;
 
     public override string Name => _inner.Name;
     public override string Description => _inner.Description;
@@ -41,19 +36,7 @@ public class TimedAIFunction : AIFunction
         var sw = Stopwatch.StartNew();
         var result = await _inner.InvokeAsync(arguments, cancellationToken);
         sw.Stop();
-
-        var resultStr = result?.ToString() ?? "";
-        var originalLength = resultStr.Length;
-        if (resultStr.Length > _maxResultLength)
-        {
-            result = $"{resultStr[.._maxResultLength]}\n... [truncated, showing {_maxResultLength} of {originalLength} chars. Ask user to narrow their query if more detail is needed.]";
-            AnsiConsole.MarkupLine($"  [yellow]>> Tool '{Markup.Escape(Name)}' completed in {sw.Elapsed.TotalSeconds:F2}s (result truncated: {originalLength} -> {_maxResultLength} chars)[/]");
-        }
-        else
-        {
-            AnsiConsole.MarkupLine($"  [yellow]>> Tool '{Markup.Escape(Name)}' completed in {sw.Elapsed.TotalSeconds:F2}s ({originalLength} chars)[/]");
-        }
-
+        AnsiConsole.MarkupLine($"  [yellow]>> Tool '{Markup.Escape(Name)}' completed in {sw.Elapsed.TotalSeconds:F2}s[/]");
         return result;
     }
 }
