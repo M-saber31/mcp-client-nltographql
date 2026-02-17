@@ -166,7 +166,8 @@ public class ChatBot
             // Load allowed queries from JSON file
             AnsiConsole.WriteLine("Loading allowed queries...");
             var allowedQueriesJson = await File.ReadAllTextAsync("allowed-queries.json");
-            var allowedQueries = JsonSerializer.Deserialize<List<AllowedQuery>>(allowedQueriesJson)
+            var allowedQueries = JsonSerializer.Deserialize<List<AllowedQuery>>(allowedQueriesJson,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                 ?? throw new InvalidOperationException("Failed to load allowed-queries.json");
             var queryCatalog = BuildQueryCatalog(allowedQueries);
             AnsiConsole.MarkupLine($"[yellow]Loaded {allowedQueries.Count} allowed queries. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
