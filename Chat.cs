@@ -253,7 +253,7 @@ public class ChatBot
                     var text = update.Text;
                     if (!string.IsNullOrEmpty(text))
                     {
-                        AnsiConsole.Write(text);
+                        Console.Write(text);
                     }
                 }
                 turnSw.Stop();
