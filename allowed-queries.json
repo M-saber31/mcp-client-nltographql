@@ -1,0 +1,10 @@
+[
+  {
+    "description": "Get course content based on the content given",
+    "query": "query { contents(first: 1, filter: { ContentContainer:  { contains: $Topic } }) { items { ContentContainer } } }"
+  },
+  {
+    "description": "Get course enrollments for specific student by giving the userid",
+    "query": "query { courseEnrollments(first: 100, filter: { Username: {eq : $userid } } ) { items { Username SubjectID EnrollmentID CompletionPercent } } }"
+  }
+]

@@ -163,24 +163,13 @@ public class ChatBot
             AnsiConsole.MarkupLine($"[yellow]Tool discovery completed. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
             sw.Restart();
 
-            // Introspect schema for the system prompt
-            AnsiConsole.WriteLine("Introspecting GraphQL schema...");
-            var introspectTool = mcpTools.FirstOrDefault(t => t.Name == "introspect-schema");
-            string schemaSummary;
-            if (introspectTool != null)
-            {
-                var schemaResult = await mcpClient.CallToolAsync("introspect-schema");
-                var schemaJson = schemaResult.Content
-                    .Where(c => c.Type == "text")
-                    .Select(c => c.Text)
-                    .FirstOrDefault() ?? string.Empty;
-                schemaSummary = ExtractSchemaSummary(schemaJson);
-            }
-            else
-            {
-                schemaSummary = "Schema not available - use introspection tools if needed.";
-            }
-            AnsiConsole.MarkupLine($"[yellow]Schema introspection completed. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
+            // Load allowed queries from JSON file
+            AnsiConsole.WriteLine("Loading allowed queries...");
+            var allowedQueriesJson = await File.ReadAllTextAsync("allowed-queries.json");
+            var allowedQueries = JsonSerializer.Deserialize<List<AllowedQuery>>(allowedQueriesJson)
+                ?? throw new InvalidOperationException("Failed to load allowed-queries.json");
+            var queryCatalog = BuildQueryCatalog(allowedQueries);
+            AnsiConsole.MarkupLine($"[yellow]Loaded {allowedQueries.Count} allowed queries. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
             sw.Restart();
 
             // Create the Azure OpenAI agent with MCP tools and schema baked into instructions
@@ -195,21 +184,24 @@ public class ChatBot
             var agent = chatClient.AsAIAgent(
                 instructions: $"""
                     You are an AI assistant that helps users query data via a GraphQL API.
-                    The API exposes the following queries:
+                    Today's date is {DateTime.Now:yyyy-MM-dd}.
 
-                    {schemaSummary}
+                    ## ALLOWED QUERIES
+                    You may ONLY execute the following pre-approved GraphQL queries using the query-graphql tool.
+                    Do NOT invent, modify, or construct any other queries. Use ONLY the exact query templates below,
+                    substituting variable values as needed based on the user's request.
 
-                    Use a professional tone when answering and provide a summary of data instead of lists.
-                    If users ask about topics you don't know, answer that you don't know. Today's date is {DateTime.Now:yyyy-MM-dd}.
-                    You must use the provided query-graphql tool to query the GraphQL API with valid GraphQL query strings.
-                    The schema above is complete — do NOT call introspect-schema, it is not available as a tool.
-                    IMPORTANT: Always use pagination arguments (e.g. first: 20) to limit query results. Never fetch all rows at once.
-                    Only request the specific fields needed to answer the user's question — do not select all fields.
-                    If the user needs aggregate data (counts, totals), prefer using available aggregate queries over fetching raw rows.
+                    {queryCatalog}
+
+                    ## RULES
+                    - You MUST use one of the allowed queries above. If the user asks for data that none of these queries can answer, politely explain that the query is not available.
+                    - Always set the $first variable to limit results (e.g. 20) unless the user specifically asks for more.
+                    - Use a professional tone and provide a summary of data instead of raw lists.
+                    - If the user's request maps to multiple allowed queries, you may call query-graphql multiple times.
                     """,
                 name: "GraphQLAssistant",
                 tools: mcpTools
-                    .Where(t => t.Name != "introspect-schema")
+                    .Where(t => t.Name == "query-graphql")
                     .Select(t => (AITool)new TimedAIFunction(t))
                     .ToList(),
                 clientFactory: inner => new TimingChatClient(inner),
@@ -416,80 +408,23 @@ public class ChatBot
         AnsiConsole.MarkupLine("[bold yellow]---------------------------------------[/]");
     }
 
-    private static string ExtractSchemaSummary(string schemaJson)
+    private static string BuildQueryCatalog(List<AllowedQuery> queries)
     {
-        try
+        var sb = new StringBuilder();
+        for (int i = 0; i < queries.Count; i++)
         {
-            var doc = JsonDocument.Parse(schemaJson);
-            var root = doc.RootElement;
-
-            JsonElement schema;
-            if (root.TryGetProperty("data", out var data) && data.TryGetProperty("__schema", out schema))
-            { }
-            else if (root.TryGetProperty("__schema", out schema))
-            { }
-            else
-            {
-                return schemaJson;
-            }
-
-            var queryTypeName = schema.GetProperty("queryType").GetProperty("name").GetString();
-            var mutationTypeName = schema.TryGetProperty("mutationType", out var mt) && mt.ValueKind != JsonValueKind.Null
-                ? mt.GetProperty("name").GetString()
-                : null;
-
-            var types = schema.GetProperty("types");
-            var sb = new StringBuilder();
-
-            foreach (var type in types.EnumerateArray())
-            {
-                var typeName = type.GetProperty("name").GetString();
-                if (typeName == null || typeName.StartsWith("__"))
-                    continue;
-
-                bool isQuery = typeName == queryTypeName;
-                bool isMutation = typeName == mutationTypeName;
-
-                if ((isQuery || isMutation) && type.TryGetProperty("fields", out var fields) && fields.ValueKind == JsonValueKind.Array)
-                {
-                    sb.AppendLine(isQuery ? "## Available Queries:" : "## Available Mutations:");
-
-                    foreach (var field in fields.EnumerateArray())
-                    {
-                        var fieldName = field.GetProperty("name").GetString();
-                        var description = field.TryGetProperty("description", out var desc) && desc.ValueKind == JsonValueKind.String
-                            ? desc.GetString()
-                            : null;
-
-                        sb.Append($"- {fieldName}");
-                        if (!string.IsNullOrEmpty(description))
-                            sb.Append($": {description}");
-
-                        if (field.TryGetProperty("args", out var args) && args.ValueKind == JsonValueKind.Array && args.GetArrayLength() > 0)
-                        {
-                            var argNames = new List<string>();
-                            foreach (var arg in args.EnumerateArray())
-                            {
-                                var argName = arg.GetProperty("name").GetString();
-                                if (argName != null)
-                                    argNames.Add(argName);
-                            }
-                            if (argNames.Count > 0)
-                                sb.Append($" (args: {string.Join(", ", argNames)})");
-                        }
-
-                        sb.AppendLine();
-                    }
-                    sb.AppendLine();
-                }
-            }
-
-            var summary = sb.ToString();
-            return string.IsNullOrWhiteSpace(summary) ? schemaJson : summary;
+            sb.AppendLine($"### Query {i + 1}: {queries[i].Description}");
+            sb.AppendLine($"```graphql");
+            sb.AppendLine(queries[i].Query);
+            sb.AppendLine($"```");
+            sb.AppendLine();
         }
-        catch
-        {
-            return schemaJson;
-        }
+        return sb.ToString();
     }
+}
+
+public class AllowedQuery
+{
+    public string Description { get; set; } = string.Empty;
+    public string Query { get; set; } = string.Empty;
 }
