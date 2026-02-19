@@ -9,7 +9,7 @@
   },
   {
     "description": "List all contents finished by the student based on the username (returns course trackings and their contents with learning level details).",
-    "query": "query { courseTrackings(first: 1000, filter: { StudentUsername: { eq: $username } }) { items { contents { ContentID learningLevels { SubjectID LevelName LearningLevelID } } } } }"
+    "query": "query { courseTrackings(first: 1000, filter: { StudentUsername: { eq: $username } }) { items { contents { ContentID learningLevels { SubjectID LevelName LearningLevelID courseVersions{ Title }} } } } }"
   }
  
 ]
