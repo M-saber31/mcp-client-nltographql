@@ -6,5 +6,10 @@
   {
     "description": "Get course enrollments for specific student by giving the userid",
     "query": "query { courseEnrollments(first: 100, filter: { Username: {eq : $userid } } ) { items { Username SubjectID EnrollmentID CompletionPercent } } }"
+  },
+  {
+    "description": "List all contents finished by the student based on the username (returns course trackings and their contents with learning level details).",
+    "query": "query { courseTrackings(first: 1000, filter: { StudentUsername: { eq: $username } }) { items { contents { ContentID learningLevels { SubjectID LevelName LearningLevelID } } } } }"
   }
+ 
 ]
