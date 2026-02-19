@@ -10,6 +10,10 @@
   {
     "description": "List all contents finished by the student based on the username (returns course trackings and their contents with learning level details).",
     "query": "query { courseTrackings(first: 1000, filter: { StudentUsername: { eq: $username } }) { items { contents { ContentID learningLevels { SubjectID LevelName LearningLevelID courseVersions{ Title }} } } } }"
+  },
+  {
+    "description": "Get contents NOT finished by a student for a given SubjectID and LearningLevelID by excluding multiple finished ContentIDs (pass the finished content IDs and add them as multiple neq conditions).",
+    "query": "query { learningLevels(filter: { SubjectID: { eq: $subjectId } and: [{ LearningLevelID: { eq: $learningLevelId } }] }) { items { SubjectID LearningLevelID LevelName contents(filter: { and: [ { ContentID: { neq: $finishedContentId1 } } { ContentID: { neq: $finishedContentId2 } } ] }) { items { ContentID } } } } }"
   }
  
 ]
