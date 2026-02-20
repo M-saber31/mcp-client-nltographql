@@ -14,6 +14,10 @@
   {
     "description": "Get contents NOT finished by a student for a given SubjectID and LearningLevelID by excluding multiple finished ContentIDs (pass the finished content IDs and add them as multiple neq conditions).",
     "query": "query { learningLevels(filter: { SubjectID: { eq: $subjectId } and: [{ LearningLevelID: { eq: $learningLevelId } }] }) { items { SubjectID LearningLevelID LevelName contents(filter: { and: [ { ContentID: { neq: $finishedContentId1 } } { ContentID: { neq: $finishedContentId2 } } ] }) { items { ContentID } } } } }"
+  },
+  {
+    "description": "List contents by a provided list of ContentIDs.",
+    "query": "query { contents(filter: { ContentID: { in: [$contentIds] } }) { items { ContentID ContentContainer } } }"
   }
  
 ]
