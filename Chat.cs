@@ -284,7 +284,7 @@ public class ChatBot
                 {
                     var usernameMatch = Regex.Match(
                         question,
-                        @"username\s+[""']?(\w+)[""']?",
+                        @"username\s+[""']?([\w\-\.@]+)[""']?",
                         RegexOptions.IgnoreCase);
 
                     if (usernameMatch.Success)
