@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Agents.AI;
@@ -131,7 +132,7 @@ public class ChatBot
             b.AddProvider(new SpectreConsoleLoggerProvider());
         });
 
-        (var agent, var mcpClient, var session) = await AnsiConsole.Status().StartAsync("Booting up agents...", async ctx =>
+        (var agent, var plannerAgent, var mcpClient, var session) = await AnsiConsole.Status().StartAsync("Booting up agents...", async ctx =>
         {
             ctx.Spinner(Spinner.Known.Default);
             ctx.SpinnerStyle(Style.Parse("yellow"));
@@ -217,12 +218,38 @@ public class ChatBot
             );
 
             AnsiConsole.MarkupLine($"[yellow]Agent initialized. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
+            sw.Restart();
+
+            // Create the planner agent — pure reasoning, no MCP tools.
+            // It receives structured course data and produces a study plan.
+            AnsiConsole.WriteLine("Initializing planner agent...");
+            var plannerAgent = chatClient.AsAIAgent(
+                instructions: """
+                    You are a student study advisor.
+                    You will receive a JSON summary of a student's unfinished course content
+                    (subjects, learning levels, and content titles).
+
+                    Create a structured weekly study plan that:
+                    - Groups related content by subject and learning level
+                    - Prioritizes subjects with lower completion percentages first
+                    - Suggests a realistic number of content items per day (2-3 items max)
+                    - Uses clear headings (Week 1, Day 1: ..., etc.)
+                    - Is encouraging and supportive in tone
+
+                    Output the study plan as plain readable text only.
+                    Do not call any tools or APIs.
+                    """,
+                name: "StudyPlanner",
+                clientFactory: inner => new TimingChatClient(inner),
+                loggerFactory: loggerFactory
+            );
+            AnsiConsole.MarkupLine($"[yellow]Planner agent initialized. ({sw.Elapsed.TotalSeconds:F2}s)[/]");
 
             // Create a session to manage conversation state
             var session = await agent.CreateSessionAsync();
 
             AnsiConsole.WriteLine("All done.");
-            return (agent, mcpClient, session);
+            return (agent, plannerAgent, mcpClient, session);
         });
 
         AnsiConsole.WriteLine("Ready to chat! Hit 'ctrl-c' to quit.");
@@ -249,6 +276,38 @@ public class ChatBot
                     case "/h":
                         DisplaySessionContents(agent, session);
                         continue;
+                }
+
+                // Detect study plan trigger:
+                // Matches messages like "please create a study plan for student with username alice"
+                if (question.Contains("study plan", StringComparison.OrdinalIgnoreCase))
+                {
+                    var usernameMatch = Regex.Match(
+                        question,
+                        @"username\s+[""']?(\w+)[""']?",
+                        RegexOptions.IgnoreCase);
+
+                    if (usernameMatch.Success)
+                    {
+                        var username = usernameMatch.Groups[1].Value;
+                        AnsiConsole.WriteLine();
+                        AnsiConsole.MarkupLine($"[yellow]>> Study plan workflow triggered for student '{username}'[/]");
+                        AnsiConsole.MarkupLine("[yellow]>> Running workflow: DataGathering → PlannerAgent...[/]");
+                        AnsiConsole.WriteLine();
+
+                        var planSw = Stopwatch.StartNew();
+                        var plan = await StudyPlanWorkflowRunner.RunAsync(
+                            username: username,
+                            userId: username,   // adjust if userId differs from username
+                            graphqlAgent: agent,
+                            plannerAgent: plannerAgent);
+                        planSw.Stop();
+
+                        AnsiConsole.Write("🤖: ");
+                        Console.WriteLine(plan);
+                        AnsiConsole.MarkupLine($"[yellow]>> Study plan generated in {planSw.Elapsed.TotalSeconds:F2}s[/]");
+                        continue;
+                    }
                 }
 
                 AnsiConsole.WriteLine();
